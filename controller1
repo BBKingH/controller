@@ -1,0 +1,122 @@
+#define   SERVO_PIN  3
+#define   SO_PIN  4
+#define   CS_PIN  5
+#define   SCK_PIN  6
+#define   BTN_PIN  8
+
+boolean button;
+boolean button_flag = 0;
+static uint32_t button_tmr = 0;
+
+float output;
+float temperature;
+float t_max=250;
+float t_PID=t_max;
+float Kp=1;
+float Ki=0.1;
+float Kd=0.2;
+static long int Dt=10*1000; //період заміру температури
+static int phase=0; //фаза
+static int P_old=0; //попереднє відхилення
+static int t_old=0; //попередня температура
+static int P; //пропорційна складова
+static int I; //інтегральна складова
+static int D; //диференційна складова
+static uint32_t phase_tmr; //таймер фази
+
+#include <Servo.h>
+#include <max6675.h>
+
+Servo servo1;
+MAX6675 thermocouple(SCK_PIN, CS_PIN, SO_PIN);
+
+//фаза 0 - закрити заслінку, очікування
+//фаза 1 - розпал
+//фаза 2 - горіння
+//фаза 3 - згасання
+
+void setup() {
+  //заслінка закрита  == серво 0
+  //заслінка відкрита == серво 90
+  pinMode (BTN_PIN, INPUT_PULLUP);//кнопка переходу в фазу розпалу
+  Serial.begin(9600);
+  servo1.attach(SERVO_PIN);
+  servo1.write(0);
+}
+
+void loop() {
+
+  button = !digitalRead(BTN_PIN);
+  if (button == 1 && button_flag == 0){ //якщо натиснули кнопку, то рахувати яке натискання
+    button_flag = 1;
+    button_tmr = millis();
+    }
+  if (button == 0 && button_flag == 1 && millis() - button_tmr > 5*1000){ //якщо довгий клік, то шукати пульт
+      search_for_remote();
+      button_tmr = millis();
+      button_flag = 0;
+    }
+  if (button == 0 && button_flag == 1 && millis() - button_tmr > 0.05*1000){ //якщо короткий клік, то перейти до розпалювання
+      phase = 1;
+      phase_tmr = millis();
+      button_tmr = millis();
+      button_flag = 0;
+    }
+
+  if (phase == 0){
+    servo1.write(0); //у фазі очікування заслінка стає на закриту
+    }
+  
+  else if (phase == 1){
+    pidControl();
+    if (temperature > 100 && temperature-t_old > 5){
+      phase=2; //перейти до горіння
+    }
+    else if ((millis() - phase_tmr > (unsigned long) 30*60*1000) && (temperature < 100)){
+      phase = 0;//повернутись до режиму очікування
+      }
+    t_old=temperature;
+  }
+  else if (phase == 2){
+    t_PID=t_max;//температура утримування горіння
+    pidControl();//викораємо зчитування температури і регулювання заслінки
+    if (t_PID-temperature > 70) { 
+      t_PID=180;
+      phase=3;
+    }//якщо температура сильно впала, то переходимо до згасання
+  }
+  else if (phase == 3){
+    pidControl();//викораємо зчитування температури і регулювання заслінки
+    if (temperature < 100) { phase = 0;    //якщо температура впала менше 100С, то переходимо до фази очікування
+    }
+    if (t_PID - temperature > 25) { t_PID-=30;    //опускаємо температуру утримування
+    }
+  }
+  
+  
+  else {
+    phase = 0;//якщо нічого не залишається, переходимо в фазі очікування
+  }
+  
+}
+void pidControl(){
+  static uint32_t tmr;
+  if(millis()- tmr > 10*1000){
+    tmr = millis();
+    temperature = thermocouple.readCelsius();
+    P = t_PID-temperature;
+    I = I + P*Dt;
+    D = (P-P_old)/Dt;
+    P_old = P;
+    output = P*Kp + I*Ki + D*Kd;
+    if(output <= 90){servo1.write(output);
+    }
+    //debug
+    Serial.print("Temperature: ");
+    Serial.print(temperature);
+    Serial.println(" C"); 
+    //debug
+  }
+}
+
+void search_for_remote(){};
