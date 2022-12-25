@@ -1,122 +1,251 @@
-#define   SERVO_PIN  3
-#define   SO_PIN  4
-#define   CS_PIN  5
-#define   SCK_PIN  6
-#define   BTN_PIN  8
+//Енкодер з кнопкою
+#define CLK_ENC 2 //лічильник енкодера
+#define DT_ENC 3 //дані енкодера
+#define SW_ENC 4 //кнопка
+//Сервомотор
+#define   SERVO_PIN  9 //управління сервомотором
+//Термопара димоходу MAX6675
+#define   SO_PIN  5
+#define   CS_PIN  6
+#define   SCK_PIN  7
+//Диспплей 7 сегментів 4 регістри TM1637
+#define CLK_DISP 10 //лічильник дисплею
+#define DIO_DISP 11 //дані дисплею
 
-boolean button;
-boolean button_flag = 0;
-static uint32_t button_tmr = 0;
-
-float output;
-float temperature;
-float t_max=250;
-float t_PID=t_max;
-float Kp=1;
-float Ki=0.1;
-float Kd=0.2;
-static long int Dt=10*1000; //період заміру температури
-static int phase=0; //фаза
+boolean button = 0; //значення кнопки
+boolean button_flag = 0; //прапорець кнопки
+static uint32_t button_tmr = 0; //таймер кнопки
+static uint32_t tmr; //загальний таймер
+volatile int output; //вихід на сервомотор
+static int old_output; //вихід на сервомотор
+float temperature; //заміряна поточна температура
+int t_max=450; //максимамльна температура PID
+volatile int t_PID=220; //температура PID
+static int old_t_PID; //стара температура утримування
+float Kp=5; //коефіцієнт пропорційного регулювання
+float Ki=0.001; //коефіцієнт інтегрального регулювання
+float Kd=10; //коефіцієнт диференційного регулювання
+static long int Dt=1; //період заміру температури
+volatile int phase=1; //фаза роботи автоматики
 static int P_old=0; //попереднє відхилення
 static int t_old=0; //попередня температура
 static int P; //пропорційна складова
 static int I; //інтегральна складова
 static int D; //диференційна складова
 static uint32_t phase_tmr; //таймер фази
+static int Period=5000; //період вимірювання температури
+static int brightness=2; //яскравість екрану 0-7
 
-#include <Servo.h>
-#include <max6675.h>
+#include <Servo.h> //бібліотека сервомотора
+#include <max6675.h> //бібліотека сервопари
+#include <Wire.h> //бібліотека І2С адресного зв'язку
+#include <Encoder.h> //бібліотека енкодера
+#include <TM1637.h> //бібліотека дисплею
+TM1637 tm(CLK_DISP,DIO_DISP); //ініціалізація дисплею
+Encoder enc1(CLK_ENC, DT_ENC); //ініціалізація енкодера
+Servo servo1; //ініціалізація сервомотора
+MAX6675 thermocouple(SCK_PIN, CS_PIN, SO_PIN); //ініціалізація термопари
 
-Servo servo1;
-MAX6675 thermocouple(SCK_PIN, CS_PIN, SO_PIN);
-
-//фаза 0 - закрити заслінку, очікування
-//фаза 1 - розпал
-//фаза 2 - горіння
-//фаза 3 - згасання
+//фаза 0 - згасання
+//фаза 1 - горіння
+//фаза 3 - ручне регулювання
+//фаза 4 - меню налаштувань
 
 void setup() {
   //заслінка закрита  == серво 0
   //заслінка відкрита == серво 90
-  pinMode (BTN_PIN, INPUT_PULLUP);//кнопка переходу в фазу розпалу
-  Serial.begin(9600);
-  servo1.attach(SERVO_PIN);
-  servo1.write(0);
+  Serial.begin(9600); //Відкрити послідовний порт
+  Serial.println("Program Start");
+  pinMode(SW_ENC, INPUT); //назначити пін кнопки на вхід
+  servo1.attach(SERVO_PIN); //приєднати пін сервомотора
+  servo1.write(0); //закрити заслінку
+  tm.init(); //ініціювати роботу дисплею
+  tm.set(brightness); //яскравість дисплею
+  tm.display(0,1);
+  tm.display(1,20);
+  tm.display(2,1);
+  tm.display(3,18);
+  delay(2000); //затримка 2с на пропрацювання сервомотора
+  //display
+  
 }
 
-void loop() {
+static long oldPosition  = -999; // змінити на -999 для старту ручного режиму, або на 1 для автоматичного
+static long newPosition = 1; //значення нової позиції одразу встановимо відмінним від старої
 
-  button = !digitalRead(BTN_PIN);
-  if (button == 1 && button_flag == 0){ //якщо натиснули кнопку, то рахувати яке натискання
+void loop() { 
+  
+  UserInterface();//робота регулятора з кнопкою
+
+  if(millis()- tmr > Dt*Period){//виміряти температуру по періоду
+
+    tmr = millis();//занулити таймер
+    temperature = thermocouple.readCelsius();//виміряти температуру
+
+    if (phase == 0){//якщо згасання
+      displayFade();//відобразити текст FAdE
+      servo1.write((temperature-20)/3);//заслінка від 100С до 20С -> 90град до 0град
+    }
+  
+    else if (phase == 1){//якщо нормальна робота
+      pidControl();//здійснювати контроль температури
+      if ((millis() - phase_tmr > (unsigned long) 30*60*1000) && (temperature < 100)){ //якщо пройшло 30хв від початку розпалу
+        phase = 0;//перейти в режим згасання
+        }
+      t_old=temperature; //запам'ятати стару температуру
+    }
+
+    else {
+    //якщо інший варіант, переходимо в ручне керування
+    }
+  }
+}
+
+void pidControl(){
+
+  P = t_PID-temperature;
+  Serial.print("P: ");
+  Serial.println(P);
+  I = I + P*Dt;
+  Serial.print("I: ");
+  Serial.println(I);
+  D = (P-P_old)/Dt;
+  Serial.print("D: ");
+  Serial.println(D);
+  P_old = P;
+  output = P*Kp + I*Ki + D*Kd;
+
+  if (output <= 90 && output > 0){
+    servo1.write(output);
+  }
+  else if (output > 90) {
+    output = 90;
+    servo1.write(90);
+  }
+  else if (output < 0) {
+    output = 0;
+    servo1.write(0);
+  }
+  //debug 
+  Serial.print("Set PID Temperature: ");
+  Serial.print(t_PID);
+  Serial.println(" C");
+  Serial.print("Temperature: ");
+  Serial.print(temperature);
+  Serial.println(" C");
+  Serial.print("Servo Output ");
+  Serial.println(output);
+  //display
+  displayGrad(temperature);
+}
+
+void search_for_remote(){};//пошук пульта
+
+void UserInterface(){
+  
+  newPosition = enc1.read();
+  button = digitalRead(SW_ENC);
+
+  if (button == 0 && button_flag == 0){ //якщо натиснули кнопку, то рахувати яке натискання
     button_flag = 1;
     button_tmr = millis();
+    Serial.println("button pressed");
     }
-  if (button == 0 && button_flag == 1 && millis() - button_tmr > 5*1000){ //якщо довгий клік, то шукати пульт
-      search_for_remote();
+  if (button == 1 && button_flag == 1 && millis() - button_tmr > 1*1000){ //автовихід з встановлення температури PID
       button_tmr = millis();
-      button_flag = 0;
     }
-  if (button == 0 && button_flag == 1 && millis() - button_tmr > 0.05*1000){ //якщо короткий клік, то перейти до розпалювання
+  if (button == 1 && button_flag == 1 && millis() - button_tmr > 0.02*1000 && millis() - button_tmr < 0.5*1000){ //якщо короткий клік, то перейти до розпалювання
       phase = 1;
       phase_tmr = millis();
       button_tmr = millis();
       button_flag = 0;
+      Serial.println("ABTO");
     }
 
-  if (phase == 0){
-    servo1.write(0); //у фазі очікування заслінка стає на закриту
-    }
-  
-  else if (phase == 1){
-    pidControl();
-    if (temperature > 100 && temperature-t_old > 5){
-      phase=2; //перейти до горіння
-    }
-    else if ((millis() - phase_tmr > (unsigned long) 30*60*1000) && (temperature < 100)){
-      phase = 0;//повернутись до режиму очікування
+  if( button_flag == 0){
+
+    if (newPosition != oldPosition) {
+      if (newPosition >  oldPosition){ //якщо покрутити вправо, то +5 град заслінки аж до 90 град
+         if (output <= 89) {
+          output=output+1;
+          phase = 3;
+          Serial.print("manual override shutter = ");
+          Serial.println(output);
+          servo1.write(output);
+          //display manual and shutter angle
+          displayShut(output);
+         }
+       }
+        if (newPosition <  oldPosition){ //якщо покрутити вліво, то -5 град заслінки аж до 0 град
+          if (output >= 1) {output=output-1;
+            phase = 3;
+            Serial.print("manual override shutter = ");
+            Serial.println(output);
+            servo1.write(output);
+            //display manual and shutter angle
+            displayShut(output);
+         }
+       }
+       oldPosition = newPosition;
+     }
+  }
+
+
+
+  if (button_flag == 1){
+    if (newPosition != oldPosition) {
+      if (newPosition >  oldPosition){ //якщо покрутити вправо, то +5 град заслінки аж до 90 град
+        if (t_PID <= (t_max-2)){
+          t_PID+=2;
+          phase = 3;
+          Serial.print("T_DIP = ");
+          Serial.println(t_PID);
+          //display PID temperature
+          displayPID(t_PID);
+        }
       }
-    t_old=temperature;
-  }
-  else if (phase == 2){
-    t_PID=t_max;//температура утримування горіння
-    pidControl();//викораємо зчитування температури і регулювання заслінки
-    if (t_PID-temperature > 70) { 
-      t_PID=180;
-      phase=3;
-    }//якщо температура сильно впала, то переходимо до згасання
-  }
-  else if (phase == 3){
-    pidControl();//викораємо зчитування температури і регулювання заслінки
-    if (temperature < 100) { phase = 0;    //якщо температура впала менше 100С, то переходимо до фази очікування
+      if (newPosition <  oldPosition){ //якщо покрутити вліво, то -5 град заслінки аж до 0 град
+        if (t_PID >= 2){
+          t_PID-=2;
+          phase = 3;
+          Serial.print("T_PID = ");
+          Serial.println(t_PID);
+          //display PID temperature
+          displayPID(t_PID);
+          }
+        }
     }
-    if (t_PID - temperature > 25) { t_PID-=30;    //опускаємо температуру утримування
-    }
+    oldPosition = newPosition;
   }
-  
-  
-  else {
-    phase = 0;//якщо нічого не залишається, переходимо в фазі очікування
-  }
-  
-}
-void pidControl(){
-  static uint32_t tmr;
-  if(millis()- tmr > 10*1000){
-    tmr = millis();
-    temperature = thermocouple.readCelsius();
-    P = t_PID-temperature;
-    I = I + P*Dt;
-    D = (P-P_old)/Dt;
-    P_old = P;
-    output = P*Kp + I*Ki + D*Kd;
-    if(output <= 90){servo1.write(output);
-    }
-    //debug
-    Serial.print("Temperature: ");
-    Serial.print(temperature);
-    Serial.println(" C"); 
-    //debug
-  }
+
 }
 
-void search_for_remote(){};
+void displayShut(int num){   
+    tm.display(3, num % 10);   
+    tm.display(2, num / 10 % 10);
+    tm.display(1, 21); 
+    tm.display(0, 21);   
+}
+
+void displayGrad(int num){   
+    tm.display(3, 16);
+    tm.display(2, num % 10);   
+    tm.display(1, num / 10 % 10);   
+    tm.display(0, num / 100 % 10);   
+
+}
+void displayPID(int num){   
+    tm.display(3, num % 10);   
+    tm.display(2, num / 10 % 10);   
+    tm.display(1, num / 100 % 10);  
+    tm.display(0, 18); 
+
+}
+
+void displayFade(){   
+    tm.display(3, 15);   
+    tm.display(2, 10);   
+    tm.display(1, 13);  
+    tm.display(0, 14); 
+
+}
